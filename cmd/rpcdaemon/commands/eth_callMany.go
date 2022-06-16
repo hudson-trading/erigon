@@ -1,0 +1,272 @@
+package commands
+
+import (
+	"context"
+	"encoding/hex"
+	"fmt"
+	"math/big"
+	"time"
+
+	"github.com/holiman/uint256"
+	"github.com/ledgerwatch/erigon/common"
+	"github.com/ledgerwatch/erigon/common/hexutil"
+	"github.com/ledgerwatch/erigon/common/math"
+	"github.com/ledgerwatch/erigon/core"
+	"github.com/ledgerwatch/erigon/core/rawdb"
+	"github.com/ledgerwatch/erigon/core/state"
+	"github.com/ledgerwatch/erigon/core/types"
+	"github.com/ledgerwatch/erigon/core/vm"
+	"github.com/ledgerwatch/erigon/ethdb"
+	rpcapi "github.com/ledgerwatch/erigon/internal/ethapi"
+	"github.com/ledgerwatch/erigon/rpc"
+	"github.com/ledgerwatch/erigon/turbo/adapter/ethapi"
+	"github.com/ledgerwatch/erigon/turbo/rpchelper"
+	"github.com/ledgerwatch/erigon/turbo/transactions"
+	"github.com/ledgerwatch/log/v3"
+)
+
+type BlockContext struct {
+	BlockNumber *hexutil.Uint64
+	Coinbase    *common.Address
+	Timestamp   *hexutil.Uint64
+	GasLimit    *hexutil.Uint
+	Difficulty  *hexutil.Uint
+	BaseFee     *uint256.Int
+	BlockHash   *map[uint64]common.Hash
+}
+
+type Bundle struct {
+	Transactions  []rpcapi.CallArgs
+	BlockOverride BlockContext
+}
+
+type StateContext struct {
+	BlockNumber      rpc.BlockNumberOrHash
+	TransactionIndex *int
+	StateOverride    *rpcapi.StateOverrides
+}
+
+func (api *APIImpl) CallMany(ctx context.Context, bundles []Bundle, simulateContext StateContext, timeoutMilliSecondsPtr *int64) ([][]map[string]interface{}, error) {
+	var (
+		hash               common.Hash
+		replayTransactions types.Transactions
+		evm                *vm.EVM
+	)
+
+	tx, err := api.db.BeginRo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	chainConfig, err := api.chainConfig(tx)
+	if err != nil {
+		return nil, err
+	}
+	if len(bundles) == 0 {
+		return nil, fmt.Errorf("empty bundles")
+	}
+	empty := true
+	for _, bundle := range bundles {
+		if len(bundle.Transactions) != 0 {
+			empty = false
+		}
+	}
+
+	if empty {
+		return nil, fmt.Errorf("empty bundles")
+	}
+
+	defer func(start time.Time) { log.Trace("Executing EVM callMany finished", "runtime", time.Since(start)) }(time.Now())
+
+	blockNum, hash, _, err := rpchelper.GetBlockNumber(simulateContext.BlockNumber, tx, api.filters)
+	if err != nil {
+		return nil, err
+	}
+	block, err := api.blockByNumberWithSenders(tx, blockNum)
+	if err != nil {
+		return nil, err
+	}
+
+	transactionIndex := -1
+
+	if simulateContext.TransactionIndex != nil {
+		transactionIndex = *simulateContext.TransactionIndex
+	}
+
+	if transactionIndex == -1 {
+		transactionIndex = len(block.Transactions())
+	}
+
+	replayTransactions = block.Transactions()[:transactionIndex]
+
+	stateReader, err := rpchelper.CreateStateReader(ctx, tx, rpc.BlockNumberOrHashWithNumber(rpc.BlockNumber(blockNum-1)), api.filters, api.stateCache)
+
+	if err != nil {
+		return nil, err
+	}
+
+	st := state.New(stateReader)
+
+	parent := rawdb.ReadHeader(tx, hash, blockNum)
+
+	if parent == nil {
+		return nil, fmt.Errorf("block %d(%x) not found", blockNum, hash)
+	}
+
+	// Get a new instance of the EVM
+	signer := types.MakeSigner(chainConfig, blockNum)
+	firstMsg, err := bundles[0].Transactions[0].ToMessage(api.GasCap, nil)
+	rules := chainConfig.Rules(blockNum)
+
+	if len(replayTransactions) > 0 {
+		firstMsg, err = replayTransactions[0].AsMessage(*signer, nil, rules)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	contractHasTEVM := func(contractHash common.Hash) (bool, error) { return false, nil }
+
+	if api.TevmEnabled {
+		contractHasTEVM = ethdb.GetHasTEVM(tx)
+	}
+
+	timeoutMilliSeconds := int64(5000)
+	if timeoutMilliSecondsPtr != nil {
+		timeoutMilliSeconds = *timeoutMilliSecondsPtr
+	}
+	timeout := time.Millisecond * time.Duration(timeoutMilliSeconds)
+	// Setup context so it may be cancelled the call has completed
+	// or, in case of unmetered gas, setup a context with a timeout.
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	// Make sure the context is cancelled when the call has completed
+	// this makes sure resources are cleaned up.
+	defer cancel()
+
+	// Wait for the context to be done and cancel the evm. Even if the
+	// EVM has finished, cancelling may be done (repeatedly)
+	go func() {
+		<-ctx.Done()
+		evm.Cancel()
+	}()
+
+	// Setup the gas pool (also for unmetered requests)
+	// and apply the message.
+	gp := new(core.GasPool).AddGas(math.MaxUint64)
+	blockCtx, txCtx := transactions.GetEvmContext(firstMsg, parent, simulateContext.BlockNumber.RequireCanonical, tx, contractHasTEVM)
+	evm = vm.NewEVM(blockCtx, txCtx, st, chainConfig, vm.Config{Debug: false})
+	for _, txn := range replayTransactions {
+		msg, err := txn.AsMessage(*signer, nil, rules)
+		if err != nil {
+			return nil, err
+		}
+		txCtx = core.NewEVMTxContext(msg)
+		evm = vm.NewEVM(blockCtx, txCtx, evm.IntraBlockState(), chainConfig, vm.Config{Debug: false})
+		// Execute the transaction message
+		_, err = core.ApplyMessage(evm, msg, gp, true /* refunds */, false /* gasBailout */)
+		if err != nil {
+			return nil, err
+		}
+		// If the timer caused an abort, return an appropriate error message
+		if evm.Cancelled() {
+			return nil, fmt.Errorf("execution aborted (timeout = %v)", timeout)
+		}
+	}
+
+	// after replaying the txns, we want to overload the state
+	// overload state
+	if simulateContext.StateOverride != nil {
+		err = simulateContext.StateOverride.Override((evm.IntraBlockState()).(*state.IntraBlockState))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	ret := make([][]map[string]interface{}, 0)
+	overrideBlockHash := make(map[uint64]common.Hash)
+
+	for _, bundle := range bundles {
+		// first change blockContext
+		if bundle.BlockOverride.BlockNumber != nil {
+			blockCtx.BlockNumber = uint64(*bundle.BlockOverride.BlockNumber)
+		}
+		if bundle.BlockOverride.BaseFee != nil {
+			blockCtx.BaseFee = bundle.BlockOverride.BaseFee
+		}
+		if bundle.BlockOverride.Coinbase != nil {
+			blockCtx.Coinbase = *bundle.BlockOverride.Coinbase
+		}
+		if bundle.BlockOverride.Difficulty != nil {
+			blockCtx.Difficulty = big.NewInt(int64(*bundle.BlockOverride.Difficulty))
+		}
+		if bundle.BlockOverride.Timestamp != nil {
+			blockCtx.Time = uint64(*bundle.BlockOverride.Timestamp)
+		}
+		if bundle.BlockOverride.GasLimit != nil {
+			blockCtx.GasLimit = uint64(*bundle.BlockOverride.GasLimit)
+		}
+		if bundle.BlockOverride.BlockHash != nil {
+			for blockNum, hash := range *bundle.BlockOverride.BlockHash {
+				if err != nil {
+					return nil, err
+				}
+				overrideBlockHash[blockNum] = hash
+			}
+			blockCtx.GetHash = func(i uint64) common.Hash {
+				if hash, ok := overrideBlockHash[i]; ok {
+					return hash
+				}
+				hash, err := rawdb.ReadCanonicalHash(tx, i)
+				if err != nil {
+					log.Debug("Can't get block hash by number", "number", i, "only-canonical", true)
+				}
+				return hash
+			}
+		}
+		results := []map[string]interface{}{}
+		for _, txn := range bundle.Transactions {
+
+			if txn.Gas == nil || *(txn.Gas) == 0 {
+				txn.Gas = (*hexutil.Uint64)(&api.GasCap)
+			}
+			msg, err := txn.ToMessage(api.GasCap, blockCtx.BaseFee)
+			if err != nil {
+				return nil, err
+			}
+			txCtx = core.NewEVMTxContext(msg)
+			evm := vm.NewEVM(blockCtx, txCtx, evm.IntraBlockState(), chainConfig, vm.Config{Debug: false})
+			result, err := core.ApplyMessage(evm, msg, gp, true, false)
+			if err != nil {
+				return nil, err
+			}
+			// If the timer caused an abort, return an appropriate error message
+			if evm.Cancelled() {
+				return nil, fmt.Errorf("execution aborted (timeout = %v)", timeout)
+			}
+			jsonResult := make(map[string]interface{})
+			if result.Err != nil {
+				if len(result.Revert()) > 0 {
+					jsonResult["error"] = ethapi.NewRevertError(result)
+				} else {
+					jsonResult["error"] = result.Err.Error()
+				}
+			} else {
+				jsonResult["value"] = hex.EncodeToString(result.Return())
+			}
+
+			results = append(results, jsonResult)
+		}
+
+		blockCtx.BlockNumber++
+		blockCtx.Time++
+		ret = append(ret, results)
+	}
+
+	return ret, err
+}
