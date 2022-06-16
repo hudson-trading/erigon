@@ -21,7 +21,6 @@ import (
 	"github.com/ledgerwatch/erigon/rpc"
 	"github.com/ledgerwatch/erigon/turbo/adapter/ethapi"
 	"github.com/ledgerwatch/erigon/turbo/rpchelper"
-	"github.com/ledgerwatch/erigon/turbo/transactions"
 	"github.com/ledgerwatch/log/v3"
 )
 
@@ -51,8 +50,13 @@ func (api *APIImpl) CallMany(ctx context.Context, bundles []Bundle, simulateCont
 		hash               common.Hash
 		replayTransactions types.Transactions
 		evm                *vm.EVM
+		blockCtx           vm.BlockContext
+		txCtx              vm.TxContext
+		overrideBlockHash  map[uint64]common.Hash
+		baseFee            uint256.Int
 	)
 
+	overrideBlockHash = make(map[uint64]common.Hash)
 	tx, err := api.db.BeginRo(ctx)
 	if err != nil {
 		return nil, err
@@ -82,11 +86,14 @@ func (api *APIImpl) CallMany(ctx context.Context, bundles []Bundle, simulateCont
 	if err != nil {
 		return nil, err
 	}
+
 	block, err := api.blockByNumberWithSenders(tx, blockNum)
 	if err != nil {
 		return nil, err
 	}
 
+	// -1 is a default value for transaction index.
+	// If it's -1, we will try to replay every single transaction in that block
 	transactionIndex := -1
 
 	if simulateContext.TransactionIndex != nil {
@@ -115,16 +122,7 @@ func (api *APIImpl) CallMany(ctx context.Context, bundles []Bundle, simulateCont
 
 	// Get a new instance of the EVM
 	signer := types.MakeSigner(chainConfig, blockNum)
-	firstMsg, err := bundles[0].Transactions[0].ToMessage(api.GasCap, nil)
 	rules := chainConfig.Rules(blockNum)
-
-	if len(replayTransactions) > 0 {
-		firstMsg, err = replayTransactions[0].AsMessage(*signer, nil, rules)
-	}
-
-	if err != nil {
-		return nil, err
-	}
 
 	contractHasTEVM := func(contractHash common.Hash) (bool, error) { return false, nil }
 
@@ -132,10 +130,42 @@ func (api *APIImpl) CallMany(ctx context.Context, bundles []Bundle, simulateCont
 		contractHasTEVM = ethdb.GetHasTEVM(tx)
 	}
 
+	getHash := func(i uint64) common.Hash {
+		if hash, ok := overrideBlockHash[i]; ok {
+			return hash
+		}
+		hash, err := rawdb.ReadCanonicalHash(tx, i)
+		if err != nil {
+			log.Debug("Can't get block hash by number", "number", i, "only-canonical", true)
+		}
+		return hash
+	}
+
+	if parent.BaseFee != nil {
+		baseFee.SetFromBig(parent.BaseFee)
+	}
+
+	blockCtx = vm.BlockContext{
+		CanTransfer:     core.CanTransfer,
+		Transfer:        core.Transfer,
+		GetHash:         getHash,
+		ContractHasTEVM: contractHasTEVM,
+		Coinbase:        parent.Coinbase,
+		BlockNumber:     parent.Number.Uint64(),
+		Time:            parent.Time,
+		Difficulty:      new(big.Int).Set(parent.Difficulty),
+		GasLimit:        parent.GasLimit,
+		BaseFee:         &baseFee,
+	}
+
+	evm = vm.NewEVM(blockCtx, txCtx, st, chainConfig, vm.Config{Debug: false})
+
 	timeoutMilliSeconds := int64(5000)
+
 	if timeoutMilliSecondsPtr != nil {
 		timeoutMilliSeconds = *timeoutMilliSecondsPtr
 	}
+
 	timeout := time.Millisecond * time.Duration(timeoutMilliSeconds)
 	// Setup context so it may be cancelled the call has completed
 	// or, in case of unmetered gas, setup a context with a timeout.
@@ -159,8 +189,7 @@ func (api *APIImpl) CallMany(ctx context.Context, bundles []Bundle, simulateCont
 	// Setup the gas pool (also for unmetered requests)
 	// and apply the message.
 	gp := new(core.GasPool).AddGas(math.MaxUint64)
-	blockCtx, txCtx := transactions.GetEvmContext(firstMsg, parent, simulateContext.BlockNumber.RequireCanonical, tx, contractHasTEVM)
-	evm = vm.NewEVM(blockCtx, txCtx, st, chainConfig, vm.Config{Debug: false})
+
 	for _, txn := range replayTransactions {
 		msg, err := txn.AsMessage(*signer, nil, rules)
 		if err != nil {
@@ -189,7 +218,6 @@ func (api *APIImpl) CallMany(ctx context.Context, bundles []Bundle, simulateCont
 	}
 
 	ret := make([][]map[string]interface{}, 0)
-	overrideBlockHash := make(map[uint64]common.Hash)
 
 	for _, bundle := range bundles {
 		// first change blockContext
@@ -218,20 +246,9 @@ func (api *APIImpl) CallMany(ctx context.Context, bundles []Bundle, simulateCont
 				}
 				overrideBlockHash[blockNum] = hash
 			}
-			blockCtx.GetHash = func(i uint64) common.Hash {
-				if hash, ok := overrideBlockHash[i]; ok {
-					return hash
-				}
-				hash, err := rawdb.ReadCanonicalHash(tx, i)
-				if err != nil {
-					log.Debug("Can't get block hash by number", "number", i, "only-canonical", true)
-				}
-				return hash
-			}
 		}
 		results := []map[string]interface{}{}
 		for _, txn := range bundle.Transactions {
-
 			if txn.Gas == nil || *(txn.Gas) == 0 {
 				txn.Gas = (*hexutil.Uint64)(&api.GasCap)
 			}
@@ -240,7 +257,7 @@ func (api *APIImpl) CallMany(ctx context.Context, bundles []Bundle, simulateCont
 				return nil, err
 			}
 			txCtx = core.NewEVMTxContext(msg)
-			evm := vm.NewEVM(blockCtx, txCtx, evm.IntraBlockState(), chainConfig, vm.Config{Debug: false})
+			evm = vm.NewEVM(blockCtx, txCtx, evm.IntraBlockState(), chainConfig, vm.Config{Debug: false})
 			result, err := core.ApplyMessage(evm, msg, gp, true, false)
 			if err != nil {
 				return nil, err
