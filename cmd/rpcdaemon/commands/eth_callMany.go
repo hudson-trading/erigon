@@ -241,9 +241,6 @@ func (api *APIImpl) CallMany(ctx context.Context, bundles []Bundle, simulateCont
 		}
 		if bundle.BlockOverride.BlockHash != nil {
 			for blockNum, hash := range *bundle.BlockOverride.BlockHash {
-				if err != nil {
-					return nil, err
-				}
 				overrideBlockHash[blockNum] = hash
 			}
 		}
