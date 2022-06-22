@@ -20,7 +20,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -189,9 +188,6 @@ func (h *handler) handleMsg(msg *jsonrpcMessage) {
 			h.conn.writeJSON(cp.ctx, answer)
 		} else {
 			_ = stream.Flush()
-			tmpfile, _ := os.Create("debug_traceCallMany.txt")
-			tmpfile.Write(stream.Buffer())
-			tmpfile.Close()
 			h.conn.writeJSON(cp.ctx, json.RawMessage(stream.Buffer()))
 		}
 		for _, n := range cp.notifiers {
