@@ -408,6 +408,8 @@ func (api *PrivateDebugAPIImpl) TraceCallMany(ctx context.Context, bundles []Bun
 				return err
 			}
 			txCtx = core.NewEVMTxContext(msg)
+			ibs := evm.IntraBlockState().(*state.IntraBlockState)
+			ibs.Prepare(common.Hash{}, parent.Hash(), txn_index)
 			err = transactions.TraceTx(ctx, msg, blockCtx, txCtx, evm.IntraBlockState(), config, chainConfig, stream)
 
 			if err != nil {
@@ -415,9 +417,6 @@ func (api *PrivateDebugAPIImpl) TraceCallMany(ctx context.Context, bundles []Bun
 				return err
 			}
 
-			ibs := evm.IntraBlockState().(*state.IntraBlockState)
-			ibs.Prepare(common.Hash{}, parent.Hash(), txn_index)
-			evm = vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vm.Config{Debug: false})
 			if txn_index < len(bundle.Transactions)-1 {
 				stream.WriteMore()
 			}
