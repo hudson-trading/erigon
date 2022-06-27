@@ -317,7 +317,7 @@ func (api *PrivateDebugAPIImpl) TraceCallMany(ctx context.Context, bundles []Bun
 
 	st := state.New(stateReader)
 
-	parent := rawdb.ReadHeader(tx, hash, blockNum)
+	parent := block.Header()
 
 	if parent == nil {
 		stream.WriteNil()
